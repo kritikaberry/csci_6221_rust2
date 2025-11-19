@@ -1,8 +1,14 @@
+use redis::ToRedisArgs;
 use uuid::Uuid;
 use crate::error::PlayerError;
+use serde::{Deserialize, Serialize};
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct PlayerId(Uuid);
+
+impl ToRedisArgs for PlayerId {
+
+}
 
 impl PlayerId {
     pub fn new() -> PlayerId {
@@ -31,6 +37,14 @@ impl TryFrom<String> for PlayerUsername {
 pub struct Player {
     pid: PlayerId,
     mmr: Mmr,
+}
+
+impl ToRedisArgs for Player {
+    fn write_redis_args<W>(&self, out: &mut W)
+        where
+            W: ?Sized + redis::RedisWrite {
+        
+    }
 }
 
 impl Player {

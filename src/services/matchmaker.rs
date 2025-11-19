@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::models::{Player, PlayerId};
+use redis::aio::MultiplexedConnection;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct MatchMaker {
@@ -42,7 +43,7 @@ pub enum Command {
     */
 }
 
-pub async fn matchmaker(mut receiver: Receiver<Command>) {
+pub async fn matchmaker(mut receiver: Receiver<Command>, mut redis_con: MultiplexedConnection) {
     let mut matchmaker = MatchMaker::new(); 
     while let Some(command) = receiver.recv().await {
         match command {

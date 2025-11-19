@@ -1,14 +1,11 @@
 use redis::ToRedisArgs;
+use redis_macros::{FromRedisValue, ToRedisArgs};
 use uuid::Uuid;
 use crate::error::PlayerError;
 use serde::{Deserialize, Serialize};
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
 pub struct PlayerId(Uuid);
-
-impl ToRedisArgs for PlayerId {
-
-}
 
 impl PlayerId {
     pub fn new() -> PlayerId {
@@ -16,11 +13,12 @@ impl PlayerId {
         PlayerId(pid)
     }
 }
+#[derive(Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
 pub struct Mmr(i32);
 
 impl Mmr {
     pub fn new() -> Mmr {
-        Mmr(0)
+        Mmr(1200)
     }
 }
 pub struct PlayerUsername(String);
@@ -34,17 +32,11 @@ impl TryFrom<String> for PlayerUsername {
         Ok(PlayerUsername(value)) 
     }
 }
+
+#[derive(Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
 pub struct Player {
     pid: PlayerId,
     mmr: Mmr,
-}
-
-impl ToRedisArgs for Player {
-    fn write_redis_args<W>(&self, out: &mut W)
-        where
-            W: ?Sized + redis::RedisWrite {
-        
-    }
 }
 
 impl Player {

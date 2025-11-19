@@ -6,7 +6,7 @@
 	"image": "mcr.microsoft.com/devcontainers/rust:2-1-bullseye",
 	"features": {
 		"ghcr.io/devcontainers-extra/features/redis-homebrew:1": {}
-	}
+	},
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [
@@ -22,7 +22,7 @@
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
-
+	"forwardPorts": [8080]
 	// Use 'postCreateCommand' to run commands after the container is created.
 	// "postCreateCommand": "rustc --version",
 

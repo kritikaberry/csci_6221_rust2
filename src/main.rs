@@ -11,7 +11,7 @@ use services::{handler::handle_client, matchmaker::{matchmaker, Command}};
 #[tokio::main]
 async fn main() -> redis::RedisResult<()> {
     // Open connection to redis database of players
-    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap(); // ERROR HANDLE HERE
     let mut redis_con = client.get_multiplexed_async_connection().await?;
     // Create matchmaker service will use to communicate with client handlers
     let (sender, receiver) = mpsc::channel(100);

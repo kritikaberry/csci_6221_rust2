@@ -1,18 +1,20 @@
-use redis::AsyncCommands;
+mod config;
+mod elo;
+mod matchmaking;
+mod storage;
+mod tcp_server;
 
 #[tokio::main]
-async fn main() -> redis::RedisResult<()> {
-    // Connect to local Redis (must be running)
-    let client = redis::Client::open("redis://127.0.0.1/")?;
-    let mut con = client.get_multiplexed_async_connection().await?;
+async fn main() {
+    // Initialize tracing (env RUST_LOG controls level, default info)
+    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::prelude::*; // for .with()
+    let _ = tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .try_init();
 
-    println!("✅ Connected to Redis");
-
-    // Set and get a test key
-    let _: () = con.set("greeting", "Hello Redis!").await?;
-    let msg: String = con.get("greeting").await?;
-
-    println!("📦 Retrieved from Redis: {}", msg);
-
-    Ok(())
+    let cfg = config::AppCfg::default();
+    tracing::info!("🚀 CSCI 6221 – Hybrid-C Matchmaking Server Running…");
+    tcp_server::start_tcp_server(&cfg.tcp_addr).await;
 }

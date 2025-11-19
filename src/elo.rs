@@ -1,9 +1,6 @@
-pub fn expected_score(r1: f64, r2: f64) -> f64 {
-    1.0 / (1.0 + 10.0f64.powf((r2 - r1) / 400.0))
-}
-
-pub fn update_rating(old: f64, opp: f64, win: bool, k: f64) -> f64 {
-    let exp = expected_score(old, opp);
+pub fn apply_elo(r1: i32, r2: i32, win: bool) -> i32 {
+    let k = 32.0;
+    let expected = 1.0 / (1.0 + 10_f64.powf((r2 - r1) as f64 / 400.0));
     let score = if win { 1.0 } else { 0.0 };
-    old + k * (score - exp)
+    (r1 as f64 + k * (score - expected)).round() as i32
 }

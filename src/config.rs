@@ -1,14 +1,13 @@
 #[derive(Clone)]
 pub struct AppCfg {
-    pub redis_url: String,
-    pub default_rating: f64,
+    pub tcp_addr: String,
 }
 
 impl Default for AppCfg {
     fn default() -> Self {
         Self {
-            redis_url: "redis://127.0.0.1/".into(),
-            default_rating: 1200.0,
+            // use 7500 to avoid your “address already in use” on 7000
+            tcp_addr: "0.0.0.0:7500".into(),
         }
     }
 }

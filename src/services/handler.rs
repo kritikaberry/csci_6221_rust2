@@ -1,5 +1,5 @@
 use crate::models::{PlayerId, Player};
-use redis::{AsyncCommands, aio::MultiplexedConnection};
+use redis::{AsyncCommands, aio::MultiplexedConnection, io::tcp::socket2::Protocol};
 use tokio::{io::AsyncReadExt, net::{TcpStream}, sync::mpsc::Sender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use futures::{SinkExt, StreamExt};
@@ -15,27 +15,60 @@ enum ProtocolMessage {
 #[derive(Error, Debug)]
 pub enum ProtocolError {
     #[error("Redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    RedisError(#[from] redis::RedisError),
     #[error("IO error: {0}")]
-    IO(#[from] std::io::Error),
+    IoError(#[from] std::io::Error),
+    #[error("serde error: {0}")]
+    ParseError(#[from] serde_json::Error),
+}
+
+struct PlayerHandler {
+    framed: Framed<TcpStream, LengthDelimitedCodec>,
+    redis_con: MultiplexedConnection,
+    player: Option<Player>,
+    send_to_matchmaker: Sender<Command>,
+}
+
+impl PlayerHandler {
+    pub fn new(socket: TcpStream, send_to_matchmaker: Sender<Command>, redis_con: MultiplexedConnection) -> PlayerHandler{
+        let framed = Framed::new(socket, LengthDelimitedCodec::new());
+        let player: Option<Player> = None;
+        PlayerHandler {
+            framed,
+            redis_con,
+            player,
+            send_to_matchmaker
+        }
+    }
+
+    fn get_pid(&self) -> PlayerId {
+        self.player.pid()
+    }
+
+    async fn get_player_message(&mut self) -> Result<ProtocolMessage, ProtocolError> {
+        let byte_message = self.framed.next().await.unwrap()?;  
+        let message: ProtocolMessage = serde_json::from_slice(&byte_message)?;
+        Ok(message)
+    }
+
+    async fn add_player(&mut self) -> Result<PlayerId, ProtocolError>{
+        self.player = Player::new();
+        let pid = player.pid();
+        let _: () = self.redis_con.zadd(pid, &player, player.mmr()).await?;
+        Ok(*pid)
+    }
 }
 
 
-pub async fn handle_client(mut socket: TcpStream, sender: Sender<Command>, mut redis_con: MultiplexedConnection) -> Result<(), ProtocolError>{
-    println!("Handling client!");
+pub async fn handle_client(socket: TcpStream, sender: Sender<Command>, redis_con: MultiplexedConnection) -> Result<(), ProtocolError>{
+    let mut player_handler = PlayerHandler::new(socket, sender, redis_con);
 
-    let mut framed = Framed::new(socket, LengthDelimitedCodec::new());
-
-    let byte_message = framed.next().await.unwrap()?;  
-    
-    let message: ProtocolMessage = serde_json::from_slice(&byte_message).unwrap();
+    let message = player_handler.get_player_message().await?; 
 
     match message {
         ProtocolMessage::InitialConnection(pid) => {
             if pid.is_none() {
-                // Create a new player and add to redis
-                let player = Player::new();
-                let _: () = redis_con.zadd(player.pid(), &player, player.mmr()).await?; // ERROR HANDLE HERE!
+                let pid = player_handler.add_player().await?;
             }
         } 
     }

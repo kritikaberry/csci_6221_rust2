@@ -133,6 +133,62 @@ async fn queue_player(Json(payload): Json<QueueRequest>) -> Result<Json<HashMap<
         response.insert("message".to_string(), "Player is already in a match".to_string());
         return Ok(Json(response));
     }
+}
+
+async fn launch_viewer(Path(session_id): Path<String>) -> Result<Html<String>, StatusCode> {
+    // Verify session exists
+    if csci_6221_rust2::storage::get_game_session(&session_id).await.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Get game configuration based on session ID
+    let game_config = match get_game_config(&session_id) {
+        Some(config) => config,
+        None => {
+            // Return error page for unsupported game
+            let html = format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Launch Error</title>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 600px;
+            margin: 100px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            text-align: center;
+        }}
+        .container {{
+            background: #2a2a2a;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }}
+        h1 {{
+            color: #f44336;
+            margin-top: 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>❌ Launch Error</h1>
+        <p>No viewer client available for session: {}</p>
+        <p style="color: #888;">This game type may not support viewer mode.</p>
+        <p style="margin-top: 20px;">
+            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
+        </p>
+    </div>
+</body>
+</html>
+            "#, session_id);
+            return Ok(Html(html));
+        }
+    };
 
     // Register player if not already registered (with random rating)
     if status == "unknown" || !csci_6221_rust2::storage::get_rating(payload.player_id).await > 0 {

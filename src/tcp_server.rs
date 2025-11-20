@@ -173,7 +173,15 @@ async fn handle_client(mut socket: TcpStream) {
                     let r2 = get_rating(opp).await;
 
                     if hybrid_c_decision(my_rating, r2) {
-                        // remove both from queue
+                        // Double-check both players are still available (not matched in the meantime)
+                        let my_match = check_match(id).await;
+                        let opp_match = check_match(opp).await;
+                        if my_match.is_some() || opp_match.is_some() {
+                            // One of them got matched elsewhere, skip
+                            continue;
+                        }
+                        
+                        // remove both from queue (create_match will also do this, but do it here for safety)
                         remove_from_queue(id).await;
                         remove_from_queue(opp).await;
 
@@ -243,6 +251,35 @@ async fn handle_client(mut socket: TcpStream) {
             }
 
             // -------------------------------------------------
+            // VIEW (for viewers to get session info)
+            // -------------------------------------------------
+            "VIEW" => {
+                if parts.len() < 2 {
+                    writer.write_all(b"ERR Usage: VIEW <match_id>\n").await.unwrap();
+                    continue;
+                }
+                
+                let match_id_str = parts[1];
+                let match_id: u64 = match match_id_str.parse() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        writer.write_all(b"ERR Invalid match_id\n").await.unwrap();
+                        continue;
+                    }
+                };
+                
+                // Get session ID from match
+                if let Some(session_id) = get_game_session_by_match(match_id).await {
+                    info!("👁️ Viewer requested session {} for match {}", session_id, match_id);
+                    writer.write_all(format!("SESSION {}\n", session_id).as_bytes()).await.unwrap();
+                    // Generic viewer command - games should provide their own viewer client
+                    writer.write_all(format!("VIEW_SESSION {}\n", session_id).as_bytes()).await.unwrap();
+                } else {
+                    writer.write_all(b"ERR No session found for this match\n").await.unwrap();
+                }
+            }
+
+            // -------------------------------------------------
             // RESULT
             // -------------------------------------------------
             "RESULT" => {
@@ -282,6 +319,16 @@ async fn handle_client(mut socket: TcpStream) {
 
             _ => {
                 let _ = writer.write_all(b"ERR\n").await;
+            }
+                }
+            }
+            Ok(None) => {
+                // Connection closed by client
+                break;
+            }
+            Err(_) => {
+                // Error reading from connection
+                break;
             }
                 }
             }

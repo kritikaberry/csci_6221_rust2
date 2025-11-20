@@ -14,6 +14,37 @@ pub async fn register_player(id: u64, rating: i32) {
     let _: () = con.hset(&key, "status", "idle").await.unwrap();
     let _: () = con.hset(&key, "wins", 0).await.unwrap();
     let _: () = con.hset(&key, "losses", 0).await.unwrap();
+    let _: () = con.hset(&key, "is_bot", 0).await.unwrap(); // Default to not a bot
+}
+
+pub async fn mark_as_bot(id: u64) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("player:{id}");
+    let _: () = con.hset(&key, "is_bot", 1).await.unwrap();
+}
+
+pub async fn is_bot(id: u64) -> bool {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("player:{id}");
+    let bot_flag: i32 = con.hget(&key, "is_bot").await.unwrap_or(0);
+    bot_flag == 1
+}
+
+pub async fn clear_bot_data(id: u64) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    
+    // Remove from queue if present
+    remove_from_queue(id).await;
+    
+    // Remove only the bot's player data
+    // Do NOT remove matches or game sessions - those should persist
+    let key = format!("player:{id}");
+    let _: () = con.del(&key).await.unwrap_or(());
+    
+    tracing::info!("🧹 Bot player data cleared for player {} (matches and sessions preserved)", id);
 }
 
 pub async fn get_rating(id: u64) -> i32 {
@@ -74,6 +105,10 @@ pub async fn create_match(a: u64, b: u64, match_id: u64) {
     let _: () = con.hset(&key, "b", b).await.unwrap();
     let _: () = con.hset(&key, "game_id", "demo").await.unwrap();
 
+    // Mark both players as in match (so they can't be matched again)
+    let _: () = con.hset(format!("player:{a}"), "status", "inmatch").await.unwrap();
+    let _: () = con.hset(format!("player:{b}"), "status", "inmatch").await.unwrap();
+
     tracing::info!("🟢 MATCH CREATED → id={match_id}, P{a} vs P{b}");
 }
 
@@ -100,6 +135,84 @@ pub async fn remove_match(match_id: u64) {
     let _: () = con.del(key).await.unwrap_or(());
 }
 
+pub async fn cleanup_player_on_disconnect(id: u64) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    
+    // Remove from queue
+    remove_from_queue(id).await;
+    
+    // Check if player is in an ongoing match
+    if let Some((opp, _)) = check_match(id).await {
+        // Find the match_id
+        if let Some(match_id) = get_match_id_by_players(id, opp).await {
+            // Remove the match
+            remove_match(match_id).await;
+            
+            // Update opponent's status back to idle and remove from queue
+            let opp_key = format!("player:{}", opp);
+            let _: () = con.hset(&opp_key, "status", "idle").await.unwrap_or(());
+            remove_from_queue(opp).await;
+            
+            tracing::info!("🔌 Player {} disconnected, match {} (vs P{}) removed", id, match_id, opp);
+        }
+    }
+    
+    // Update player status to idle
+    let key = format!("player:{}", id);
+    let _: () = con.hset(&key, "status", "idle").await.unwrap_or(());
+    
+    tracing::info!("🧹 Cleaned up disconnected player {}", id);
+}
+
+// -------------------------------------------------
+// COMPLETED MATCHES (Match History)
+// -------------------------------------------------
+pub async fn create_completed_match(match_id: u64, player1: u64, player2: u64, winner: u64, loser: u64) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let key = format!("completed_match:{}", match_id);
+    let _: () = con.hset(&key, "match_id", match_id).await.unwrap();
+    let _: () = con.hset(&key, "player1", player1).await.unwrap();
+    let _: () = con.hset(&key, "player2", player2).await.unwrap();
+    let _: () = con.hset(&key, "winner", winner).await.unwrap();
+    let _: () = con.hset(&key, "loser", loser).await.unwrap();
+    
+    // Store timestamp
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let _: () = con.hset(&key, "completed_at", timestamp).await.unwrap();
+
+    tracing::info!("📋 COMPLETED MATCH STORED → match_id={}, P{} wins over P{}", match_id, winner, loser);
+}
+
+pub async fn get_completed_matches() -> Vec<(u64, u64, u64, u64, u64, u64)> {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let keys: Vec<String> = con.keys("completed_match:*").await.unwrap_or_default();
+    let mut matches = Vec::new();
+
+    for k in keys {
+        let match_id: Option<u64> = con.hget(&k, "match_id").await.ok();
+        let player1: Option<u64> = con.hget(&k, "player1").await.ok();
+        let player2: Option<u64> = con.hget(&k, "player2").await.ok();
+        let winner: Option<u64> = con.hget(&k, "winner").await.ok();
+        let loser: Option<u64> = con.hget(&k, "loser").await.ok();
+        let completed_at: Option<u64> = con.hget(&k, "completed_at").await.ok();
+
+        if let (Some(mid), Some(p1), Some(p2), Some(w), Some(l), Some(timestamp)) = 
+            (match_id, player1, player2, winner, loser, completed_at) {
+            matches.push((mid, p1, p2, w, l, timestamp));
+        }
+    }
+
+    // Sort by timestamp descending (most recently completed first)
+    matches.sort_by(|a, b| b.5.cmp(&a.5));
+    matches
+}
+
 // -------------------------------------------------
 // RESULTS (WIN / LOSS TRACKING)
 // -------------------------------------------------
@@ -117,4 +230,109 @@ pub async fn record_result(winner: u64, loser: u64) {
     let _: () = con.hset(&lkey, "status", "idle").await.unwrap();
 
     tracing::info!("🏁 RESULT STORED → winner=P{} loser=P{}", winner, loser);
+}
+
+pub async fn complete_match_with_result(winner: u64, loser: u64) {
+    // Record the result
+    record_result(winner, loser).await;
+    
+    // Find the match and move it to completed
+    if let Some(match_id) = get_match_id_by_players(winner, loser).await {
+        // Determine player1 and player2 (order doesn't matter, just need both IDs)
+        let player1 = winner.min(loser);
+        let player2 = winner.max(loser);
+        
+        create_completed_match(match_id, player1, player2, winner, loser).await;
+        remove_match(match_id).await;
+        
+        // Ensure both players are removed from queue
+        remove_from_queue(winner).await;
+        remove_from_queue(loser).await;
+        
+        tracing::info!("📋 Match {} completed: P{} wins over P{}", match_id, winner, loser);
+    }
+}
+
+// -------------------------------------------------
+// GAME SESSIONS (for race game)
+// -------------------------------------------------
+pub async fn create_game_session(match_id: u64, session_id: String, player1_id: u64, player2_id: u64, player1_slot: u8, player2_slot: u8) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let key = format!("game_session:{}", session_id);
+    let _: () = con.hset(&key, "match_id", match_id).await.unwrap();
+    let _: () = con.hset(&key, "player1_id", player1_id).await.unwrap();
+    let _: () = con.hset(&key, "player2_id", player2_id).await.unwrap();
+    let _: () = con.hset(&key, "player1_slot", player1_slot).await.unwrap();
+    let _: () = con.hset(&key, "player2_slot", player2_slot).await.unwrap();
+    let _: () = con.hset(&key, "status", "waiting").await.unwrap();
+
+    // Also store session_id in match for easy lookup
+    let match_key = format!("match:{}", match_id);
+    let _: () = con.hset(&match_key, "game_session", &session_id).await.unwrap();
+
+    tracing::info!("🎮 GAME SESSION CREATED → session={}, match={}, P{} (slot {}) vs P{} (slot {})", 
+                   session_id, match_id, player1_id, player1_slot, player2_id, player2_slot);
+}
+
+pub async fn get_game_session(session_id: &str) -> Option<(u64, u64, u64, u8, u8)> {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let key = format!("game_session:{}", session_id);
+    let match_id: Option<u64> = con.hget(&key, "match_id").await.ok();
+    let player1_id: Option<u64> = con.hget(&key, "player1_id").await.ok();
+    let player2_id: Option<u64> = con.hget(&key, "player2_id").await.ok();
+    let player1_slot: Option<u8> = con.hget(&key, "player1_slot").await.ok();
+    let player2_slot: Option<u8> = con.hget(&key, "player2_slot").await.ok();
+
+    if let (Some(mid), Some(p1), Some(p2), Some(s1), Some(s2)) = (match_id, player1_id, player2_id, player1_slot, player2_slot) {
+        Some((mid, p1, p2, s1, s2))
+    } else {
+        None
+    }
+}
+
+pub async fn get_game_session_by_match(match_id: u64) -> Option<String> {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let match_key = format!("match:{}", match_id);
+    con.hget(&match_key, "game_session").await.ok()
+}
+
+pub async fn update_game_session_status(session_id: &str, status: &str) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let key = format!("game_session:{}", session_id);
+    let _: () = con.hset(&key, "status", status).await.unwrap();
+}
+
+pub async fn get_match_id_by_players(player1: u64, player2: u64) -> Option<u64> {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let keys: Vec<String> = con.keys("match:*").await.unwrap_or_default();
+    for k in keys {
+        let a: u64 = con.hget(&k, "a").await.unwrap_or(0);
+        let b: u64 = con.hget(&k, "b").await.unwrap_or(0);
+        if (a == player1 && b == player2) || (a == player2 && b == player1) {
+            if let Some(match_id_str) = k.strip_prefix("match:") {
+                if let Ok(match_id) = match_id_str.parse::<u64>() {
+                    return Some(match_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn remove_game_session(session_id: &str) {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("game_session:{}", session_id);
+    let _: () = con.del(key).await.unwrap_or(());
+    tracing::info!("🗑️ Game session {} removed", session_id);
 }

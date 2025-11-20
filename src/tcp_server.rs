@@ -88,12 +88,15 @@ async fn handle_client(mut socket: TcpStream) {
                     continue;
                 }
 
-                push_to_queue(id).await;
-
-                if is_bot(id).await {
-                    info!("🤖 Bot {} added to queue (bot-only matching)", id);
+                if push_to_queue(id).await {
+                    if is_bot(id).await {
+                        info!("🤖 Bot {} added to queue (bot-only matching)", id);
+                    } else {
+                        info!("📥 Player {} added to queue", id);
+                    }
                 } else {
-                    info!("📥 Player {} added to queue", id);
+                    info!("⚠️ Player {} cannot queue: already in a match", id);
+                    writer.write_all(b"ALREADY_IN_MATCH\n").await.unwrap();
                 }
 
                 // Provide dashboard link
@@ -146,13 +149,21 @@ async fn handle_client(mut socket: TcpStream) {
                 q.retain(|&x| x != id);
                 
                 // Filter queue: bots match with bots, real players match with real players
-                // Also exclude players already in a match
+                // Also exclude players already in a match (both status and actual match check)
                 let mut candidates = Vec::new();
                 for player_id in q {
                     let is_opp_bot = is_bot(player_id).await;
                     // Only match if both are bots OR both are real players
                     if is_me_bot == is_opp_bot {
-                        // Check if opponent is already in a match
+                        // Check if opponent is already in a match (both status and actual match check)
+                        let is_in_match = check_match(player_id).await.is_some();
+                        if is_in_match {
+                            // Remove from queue if they're in a match but still in queue (cleanup)
+                            remove_from_queue(player_id).await;
+                            continue;
+                        }
+                        
+                        // Also check status
                         let opp_status: String = {
                             let client = redis::Client::open("redis://127.0.0.1/").unwrap();
                             let mut con = client.get_multiplexed_async_connection().await.unwrap();
@@ -162,6 +173,9 @@ async fn handle_client(mut socket: TcpStream) {
                         // Only include if not already in a match
                         if opp_status != "inmatch" {
                             candidates.push(player_id);
+                        } else {
+                            // Status says inmatch but still in queue - remove from queue as cleanup
+                            remove_from_queue(player_id).await;
                         }
                     }
                 }
@@ -170,7 +184,15 @@ async fn handle_client(mut socket: TcpStream) {
                     let r2 = get_rating(opp).await;
 
                     if hybrid_c_decision(my_rating, r2) {
-                        // remove both from queue
+                        // Double-check both players are still available (not matched in the meantime)
+                        let my_match = check_match(id).await;
+                        let opp_match = check_match(opp).await;
+                        if my_match.is_some() || opp_match.is_some() {
+                            // One of them got matched elsewhere, skip
+                            continue;
+                        }
+                        
+                        // remove both from queue (create_match will also do this, but do it here for safety)
                         remove_from_queue(id).await;
                         remove_from_queue(opp).await;
 
@@ -178,8 +200,9 @@ async fn handle_client(mut socket: TcpStream) {
 
                         create_match(id, opp, mid).await;
 
-                        // Create game session for race game
-                        let session_id = format!("race_{}", mid);
+                        // Create generic game session (game-agnostic)
+                        // Session ID format: game_<match_id> (games can use their own prefix)
+                        let session_id = format!("game_{}", mid);
                         // Randomly assign slots (1 or 2)
                         let (p1_slot, p2_slot) = if rand::random::<bool>() {
                             (1, 2)
@@ -233,7 +256,8 @@ async fn handle_client(mut socket: TcpStream) {
                 if let Some(session_id) = get_game_session_by_match(match_id).await {
                     info!("👁️ Viewer requested session {} for match {}", session_id, match_id);
                     writer.write_all(format!("SESSION {}\n", session_id).as_bytes()).await.unwrap();
-                    writer.write_all(format!("VIEW_COMMAND cd race_game && cargo run --bin race_client -- {}\n", session_id).as_bytes()).await.unwrap();
+                    // Generic viewer command - games should provide their own viewer client
+                    writer.write_all(format!("VIEW_SESSION {}\n", session_id).as_bytes()).await.unwrap();
                 } else {
                     writer.write_all(b"ERR No session found for this match\n").await.unwrap();
                 }
@@ -250,31 +274,18 @@ async fn handle_client(mut socket: TcpStream) {
                 // Winner/loser
                 let (winner, loser) = if win { (id, opp) } else { (opp, id) };
 
-                // Find the match_id for this match
-                let match_id = get_match_id_by_players(id, opp).await;
-
-                // Elo for both sides
-                let winner_new = apply_elo(get_rating(winner).await, get_rating(loser).await, true);
-                let loser_new = apply_elo(get_rating(loser).await, get_rating(winner).await, false);
-                update_rating(winner, winner_new).await;
-                update_rating(loser, loser_new).await;
-
-                // Persist win/loss counters
-                record_result(winner, loser).await;
-
-                // Move match to completed matches and remove from ongoing
-                if let Some(mid) = match_id {
-                    create_completed_match(mid, id, opp, winner, loser).await;
-                    remove_match(mid).await;
-                    info!("📋 Match {} moved to completed: P{} wins over P{}", mid, winner, loser);
-                }
-
-                // Ensure both players are removed from queue (they can queue again)
-                remove_from_queue(id).await;
-                remove_from_queue(opp).await;
-
-                info!("🏆 RESULT: winner=P{} (new {}) loser=P{} (new {})", winner, winner_new, loser, loser_new);
-                writer.write_all(format!("RESULT_OK {} {}\n", winner_new, loser_new).as_bytes()).await.unwrap();
+                // Use complete_match_with_result to ensure all stats are updated together
+                // This ensures ratings, wins, losses are only updated when matches complete
+                // Rankings are based solely on match history
+                let winner_rating_before = get_rating(winner).await;
+                let loser_rating_before = get_rating(loser).await;
+                complete_match_with_result(winner, loser).await;
+                let winner_rating_after = get_rating(winner).await;
+                let loser_rating_after = get_rating(loser).await;
+                
+                writer.write_all(format!("RESULT_OK {} {}\n", winner_rating_after, loser_rating_after).as_bytes()).await.unwrap();
+                info!("🏆 RESULT: P{} wins over P{} | Ratings: {}→{} (winner), {}→{} (loser) | Stats updated from match history", 
+                    winner, loser, winner_rating_before, winner_rating_after, loser_rating_before, loser_rating_after);
             }
 
             _ => {

@@ -1,6 +1,7 @@
 use redis::AsyncCommands;
 
-const QUEUE: &str = "queue:demo";
+// Generic queue key - can be used by any game
+const QUEUE: &str = "queue:matchmaking";
 
 // -------------------------------------------------
 // PLAYER INFO
@@ -40,11 +41,11 @@ pub async fn clear_bot_data(id: u64) {
     remove_from_queue(id).await;
     
     // Remove only the bot's player data
-    // Do NOT remove matches or game sessions - those should persist
+    // Do NOT remove matches - those should persist
     let key = format!("player:{id}");
     let _: () = con.del(&key).await.unwrap_or(());
     
-    tracing::info!("🧹 Bot player data cleared for player {} (matches and sessions preserved)", id);
+    tracing::info!("🧹 Bot player data cleared for player {} (matches preserved)", id);
 }
 
 pub async fn get_rating(id: u64) -> i32 {
@@ -59,19 +60,42 @@ pub async fn update_rating(id: u64, new_rating: i32) {
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
     let key = format!("player:{id}");
 
+    // Only update rating (status is updated separately in record_result)
     let _: () = con.hset(&key, "rating", new_rating).await.unwrap();
-    let _: () = con.hset(&key, "status", "idle").await.unwrap();
 }
 
 // -------------------------------------------------
 // QUEUE OPS — FIFO (RPUSH / LPOP)
 // -------------------------------------------------
-pub async fn push_to_queue(id: u64) {
+pub async fn push_to_queue(id: u64) -> bool {
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
+    // Check if player is already in a match - cannot queue if in match
+    if check_match(id).await.is_some() {
+        tracing::warn!("⚠️ Player {} cannot queue: already in a match", id);
+        return false;
+    }
+    
+    // Check player status
+    let key = format!("player:{id}");
+    let status: String = con.hget(&key, "status").await.unwrap_or("idle".into());
+    if status == "inmatch" {
+        tracing::warn!("⚠️ Player {} cannot queue: status is 'inmatch'", id);
+        return false;
+    }
+
+    // Check if player is already in queue to avoid duplicates
+    let queue = get_full_queue().await;
+    if queue.contains(&id) {
+        // Already in queue, just update status
+        let _: () = con.hset(&key, "status", "queued").await.unwrap();
+        return true;
+    }
+
     let _: () = con.rpush(QUEUE, id).await.unwrap();
-    let _: () = con.hset(format!("player:{id}"), "status", "queued").await.unwrap();
+    let _: () = con.hset(&key, "status", "queued").await.unwrap();
+    true
 }
 
 pub async fn pop_queue() -> Option<u64> {
@@ -100,12 +124,23 @@ pub async fn create_match(a: u64, b: u64, match_id: u64) {
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
+    // Ensure both players are removed from queue first
+    remove_from_queue(a).await;
+    remove_from_queue(b).await;
+
+    // Double-check neither player is already in a match
+    if check_match(a).await.is_some() || check_match(b).await.is_some() {
+        tracing::warn!("⚠️ Attempted to create match {} but one or both players are already in a match", match_id);
+        return;
+    }
+
     let key = format!("match:{match_id}");
     let _: () = con.hset(&key, "a", a).await.unwrap();
     let _: () = con.hset(&key, "b", b).await.unwrap();
-    let _: () = con.hset(&key, "game_id", "demo").await.unwrap();
+    // game_id is optional metadata - actual game info is stored in game_session
+    // Leave it empty or let games set it via game_session
 
-    // Mark both players as in match (so they can't be matched again)
+    // Mark both players as in match (so they can't be matched again or queued)
     let _: () = con.hset(format!("player:{a}"), "status", "inmatch").await.unwrap();
     let _: () = con.hset(format!("player:{b}"), "status", "inmatch").await.unwrap();
 
@@ -121,9 +156,11 @@ pub async fn check_match(id: u64) -> Option<(u64, String)> {
     for k in keys {
         let a: u64 = con.hget(&k, "a").await.unwrap_or(0);
         let b: u64 = con.hget(&k, "b").await.unwrap_or(0);
+        let game_id: String = con.hget(&k, "game_id").await.unwrap_or_default();
 
-        if a == id { return Some((b, "demo".into())); }
-        if b == id { return Some((a, "demo".into())); }
+        // Return opponent ID and optional game_id (can be empty for generic matches)
+        if a == id { return Some((b, game_id)); }
+        if b == id { return Some((a, game_id)); }
     }
     None
 }
@@ -139,22 +176,27 @@ pub async fn cleanup_player_on_disconnect(id: u64) {
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
     
-    // Remove from queue
+    // Remove from queue first
     remove_from_queue(id).await;
     
     // Check if player is in an ongoing match
     if let Some((opp, _)) = check_match(id).await {
         // Find the match_id
         if let Some(match_id) = get_match_id_by_players(id, opp).await {
-            // Remove the match
+            // Remove the ongoing match (don't move to history - it's a disconnect, not a completion)
             remove_match(match_id).await;
             
-            // Update opponent's status back to idle and remove from queue
+            // Also remove any associated game session
+            if let Some(session_id) = get_game_session_by_match(match_id).await {
+                remove_game_session(&session_id).await;
+            }
+            
+            // Update opponent's status back to idle and ensure they're removed from queue
             let opp_key = format!("player:{}", opp);
             let _: () = con.hset(&opp_key, "status", "idle").await.unwrap_or(());
             remove_from_queue(opp).await;
             
-            tracing::info!("🔌 Player {} disconnected, match {} (vs P{}) removed", id, match_id, opp);
+            tracing::info!("🔌 Player {} disconnected, match {} (vs P{}) removed from ongoing matches", id, match_id, opp);
         }
     }
     
@@ -162,7 +204,7 @@ pub async fn cleanup_player_on_disconnect(id: u64) {
     let key = format!("player:{}", id);
     let _: () = con.hset(&key, "status", "idle").await.unwrap_or(());
     
-    tracing::info!("🧹 Cleaned up disconnected player {}", id);
+    tracing::info!("🧹 Cleaned up disconnected player {} (removed from queue and ongoing matches)", id);
 }
 
 // -------------------------------------------------
@@ -233,7 +275,17 @@ pub async fn record_result(winner: u64, loser: u64) {
 }
 
 pub async fn complete_match_with_result(winner: u64, loser: u64) {
-    // Record the result
+    use crate::elo::apply_elo;
+    
+    // Update ratings based on match result (only when match completes)
+    let winner_rating = get_rating(winner).await;
+    let loser_rating = get_rating(loser).await;
+    let winner_new = apply_elo(winner_rating, loser_rating, true);
+    let loser_new = apply_elo(loser_rating, winner_rating, false);
+    update_rating(winner, winner_new).await;
+    update_rating(loser, loser_new).await;
+    
+    // Record wins/losses (only when match completes)
     record_result(winner, loser).await;
     
     // Find the match and move it to completed
@@ -249,12 +301,32 @@ pub async fn complete_match_with_result(winner: u64, loser: u64) {
         remove_from_queue(winner).await;
         remove_from_queue(loser).await;
         
-        tracing::info!("📋 Match {} completed: P{} wins over P{}", match_id, winner, loser);
+        tracing::info!("📋 Match {} completed: P{} wins over P{} | Ratings: {}→{} (winner), {}→{} (loser)", 
+            match_id, winner, loser, winner_rating, winner_new, loser_rating, loser_new);
     }
 }
 
+pub async fn get_match_id_by_players(player1: u64, player2: u64) -> Option<u64> {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let keys: Vec<String> = con.keys("match:*").await.unwrap_or_default();
+    for k in keys {
+        let a: u64 = con.hget(&k, "a").await.unwrap_or(0);
+        let b: u64 = con.hget(&k, "b").await.unwrap_or(0);
+        if (a == player1 && b == player2) || (a == player2 && b == player1) {
+            if let Some(match_id_str) = k.strip_prefix("match:") {
+                if let Ok(match_id) = match_id_str.parse::<u64>() {
+                    return Some(match_id);
+                }
+            }
+        }
+    }
+    None
+}
+
 // -------------------------------------------------
-// GAME SESSIONS (for race game)
+// GAME SESSIONS (generic - works for any game)
 // -------------------------------------------------
 pub async fn create_game_session(match_id: u64, session_id: String, player1_id: u64, player2_id: u64, player1_slot: u8, player2_slot: u8) {
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
@@ -308,25 +380,6 @@ pub async fn update_game_session_status(session_id: &str, status: &str) {
 
     let key = format!("game_session:{}", session_id);
     let _: () = con.hset(&key, "status", status).await.unwrap();
-}
-
-pub async fn get_match_id_by_players(player1: u64, player2: u64) -> Option<u64> {
-    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let mut con = client.get_multiplexed_async_connection().await.unwrap();
-
-    let keys: Vec<String> = con.keys("match:*").await.unwrap_or_default();
-    for k in keys {
-        let a: u64 = con.hget(&k, "a").await.unwrap_or(0);
-        let b: u64 = con.hget(&k, "b").await.unwrap_or(0);
-        if (a == player1 && b == player2) || (a == player2 && b == player1) {
-            if let Some(match_id_str) = k.strip_prefix("match:") {
-                if let Ok(match_id) = match_id_str.parse::<u64>() {
-                    return Some(match_id);
-                }
-            }
-        }
-    }
-    None
 }
 
 pub async fn remove_game_session(session_id: &str) {

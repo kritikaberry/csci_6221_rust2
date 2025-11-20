@@ -189,6 +189,7 @@ async fn run_network_race(my_id: u64, opponent: u64, is_host: bool) -> u64 {
             }
 
             if !host_updated && last_host_update.elapsed().as_secs() > 3 {
+                // simulate opponent forward motion so match progresses visually
                 if is_p1 { x2 += 2.5; } else { x1 += 2.5; }
             }
         }
@@ -224,8 +225,39 @@ async fn run_network_race(my_id: u64, opponent: u64, is_host: bool) -> u64 {
                     if let Some(w) = winner { let _ : redis::RedisResult<()> = conn.set(&key_win, w); }
                 }
             } else {
+                // non-host: first try to read winner authored by host
                 if winner.is_none() {
                     if let Ok(w) = conn.get::<_, u64>(&key_win) { winner = Some(w); }
+                }
+
+                // Immediate local finish detection: if this non-host's local position crosses finish, finalize now
+                if winner.is_none() {
+                    // check local crossing for this client's view
+                    if (is_p1 && x1 >= finish_x) || (!is_p1 && x2 >= finish_x) {
+                        let w = if is_p1 { id_a } else { id_b };
+                        winner = Some(w);
+                        let _ : redis::RedisResult<()> = conn.set(&key_win, w);
+                        if let Ok(mut s) = TcpStream::connect("127.0.0.1:7500") {
+                            let loser = if w == id_a { id_b } else { id_a };
+                            let win_flag = if w == my_id { 1 } else { 0 };
+                            let _ = s.write_all(format!("RESULT {} {} {}\n", w, loser, win_flag).as_bytes());
+                        }
+                    }
+                }
+
+                // If host isn't present/updating and we simulated a finish, finalize locally and inform matchmaking
+                if winner.is_none() && last_host_update.elapsed().as_secs() > 5 {
+                    if x1 >= finish_x { winner = Some(id_a); }
+                    if x2 >= finish_x { winner = Some(id_b); }
+
+                    if let Some(w) = winner {
+                        let _ : redis::RedisResult<()> = conn.set(&key_win, w);
+                        if let Ok(mut s) = TcpStream::connect("127.0.0.1:7500") {
+                            let loser = if w == id_a { id_b } else { id_a };
+                            let win_flag = if w == my_id { 1 } else { 0 };
+                            let _ = s.write_all(format!("RESULT {} {} {}\n", w, loser, win_flag).as_bytes());
+                        }
+                    }
                 }
             }
         }

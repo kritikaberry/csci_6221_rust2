@@ -1,4 +1,5 @@
 use redis::AsyncCommands;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const QUEUE: &str = "queue:demo";
 
@@ -73,6 +74,12 @@ pub async fn create_match(a: u64, b: u64, match_id: u64) {
     let _: () = con.hset(&key, "a", a).await.unwrap();
     let _: () = con.hset(&key, "b", b).await.unwrap();
     let _: () = con.hset(&key, "game_id", "demo").await.unwrap();
+    // mark players as in a match
+    let _ : () = con.hset(format!("player:{}", a), "status", "inmatch").await.unwrap();
+    let _ : () = con.hset(format!("player:{}", b), "status", "inmatch").await.unwrap();
+    // record start timestamp (unix seconds)
+    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let _ : () = con.hset(&key, "started_at", started).await.unwrap();
 
     tracing::info!("🟢 MATCH CREATED → id={match_id}, P{a} vs P{b}");
 }

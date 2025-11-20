@@ -15,9 +15,7 @@ async fn main() {
         .route("/queue", post(queue_player))
         .route("/player/:id/status", get(player_status))
         .route("/play/:session_id", get(play_game))
-        .route("/view/:session_id", get(view_game))
-        .route("/launch/:session_id", get(launch_local_game))
-        .route("/launch_viewer/:session_id", get(launch_viewer));
+        .route("/view/:session_id", get(view_game));
     
     println!("🧭 Dashboard running at http://{}:8080/", local_ip);
     println!("🌐 Share this URL with other devices on your network!");
@@ -47,7 +45,6 @@ struct MatchInfo {
     a: u64,
     b: u64,
     session_id: Option<String>,
-    is_bot_match: bool, // true if both players are bots
 }
 
 #[derive(Serialize)]
@@ -90,11 +87,7 @@ async fn data() -> Json<DashboardData> {
         let a: u64 = con.hget(&mk, "a").await.unwrap_or(0);
         let b: u64 = con.hget(&mk, "b").await.unwrap_or(0);
         let session_id: Option<String> = con.hget(&mk, "game_session").await.ok();
-        // Check if both players are bots
-        let is_bot_a = csci_6221_rust2::storage::is_bot(a).await;
-        let is_bot_b = csci_6221_rust2::storage::is_bot(b).await;
-        let is_bot_match = is_bot_a && is_bot_b;
-        matches.push(MatchInfo { id: mk.clone(), a, b, session_id, is_bot_match });
+        matches.push(MatchInfo { id: mk.clone(), a, b, session_id });
     }
 
     // Get completed matches (already sorted by timestamp, most recent first)
@@ -139,604 +132,6 @@ async fn queue_player(Json(payload): Json<QueueRequest>) -> Result<Json<HashMap<
         response.insert("status".to_string(), "already_in_match".to_string());
         response.insert("message".to_string(), "Player is already in a match".to_string());
         return Ok(Json(response));
-    }
-
-    // Register player if not already registered (with random rating)
-    if status == "unknown" || !csci_6221_rust2::storage::get_rating(payload.player_id).await > 0 {
-        let rating = rand::thread_rng().gen_range(1100..1900);
-        csci_6221_rust2::storage::register_player(payload.player_id, rating).await;
-    }
-
-    // Add player to queue directly (no TCP connection needed)
-    if !csci_6221_rust2::storage::push_to_queue(payload.player_id).await {
-        let mut response = HashMap::new();
-        response.insert("success".to_string(), "false".to_string());
-        response.insert("error".to_string(), "Player is already in a match and cannot queue".to_string());
-        return Ok(Json(response));
-    }
-    
-    // Verify player is actually in the queue
-    let queue = csci_6221_rust2::storage::get_full_queue().await;
-    if !queue.contains(&payload.player_id) {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    
-    let mut response = HashMap::new();
-    response.insert("status".to_string(), "queued".to_string());
-    response.insert("player_id".to_string(), payload.player_id.to_string());
-    response.insert("message".to_string(), "Successfully added to queue".to_string());
-    
-    Ok(Json(response))
-}
-
-async fn player_status(Path(id): Path<u64>) -> Json<HashMap<String, String>> {
-    let mut response = HashMap::new();
-    
-    // 1. Check if player is already matched
-    if let Some((opp, _)) = csci_6221_rust2::storage::check_match(id).await {
-        if let Some(match_id) = csci_6221_rust2::storage::get_match_id_by_players(id, opp).await {
-            if let Some(session_id) = csci_6221_rust2::storage::get_game_session_by_match(match_id).await {
-                response.insert("status".to_string(), "matched".to_string());
-                response.insert("opponent".to_string(), opp.to_string());
-                response.insert("session_id".to_string(), session_id.clone());
-                response.insert("game_url".to_string(), format!("/play/{}?player_id={}&player_name=Player{}", session_id, id, id));
-                return Json(response);
-            } else {
-                response.insert("status".to_string(), "matched".to_string());
-                response.insert("opponent".to_string(), opp.to_string());
-                return Json(response);
-            }
-        }
-    }
-    
-    // 2. Try to match this player (active matchmaking)
-    // No restrictions: bots can match with bots, bots can match with players, players can match with players
-    let is_me_bot = csci_6221_rust2::storage::is_bot(id).await;
-    let my_rating = csci_6221_rust2::storage::get_rating(id).await;
-    let mut q = csci_6221_rust2::storage::get_full_queue().await;
-    
-    // Remove myself from local view
-    q.retain(|&x| x != id);
-    
-    // Filter queue: bots match with bots, real players match with real players
-    // Also exclude players already in a match (both status and actual match check)
-    let mut candidates = Vec::new();
-    for player_id in q {
-        let is_opp_bot = csci_6221_rust2::storage::is_bot(player_id).await;
-        // Only match if both are bots OR both are real players
-        if is_me_bot == is_opp_bot {
-            // Check if opponent is already in a match (both status and actual match check)
-            let is_in_match = csci_6221_rust2::storage::check_match(player_id).await.is_some();
-            if is_in_match {
-                // Remove from queue if they're in a match but still in queue (cleanup)
-                csci_6221_rust2::storage::remove_from_queue(player_id).await;
-                continue;
-            }
-            
-            // Also check status
-            let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-            let mut con = client.get_multiplexed_async_connection().await.unwrap();
-            let key = format!("player:{}", player_id);
-            let opp_status: String = con.hget(&key, "status").await.unwrap_or("idle".into());
-            // Only include if not already in a match
-            if opp_status != "inmatch" {
-                candidates.push(player_id);
-            } else {
-                // Status says inmatch but still in queue - remove from queue as cleanup
-                csci_6221_rust2::storage::remove_from_queue(player_id).await;
-            }
-        }
-    }
-    
-    // Try to match with candidates
-    for opp in candidates {
-        let r2 = csci_6221_rust2::storage::get_rating(opp).await;
-        
-        if csci_6221_rust2::matchmaking::hybrid_c_decision(my_rating, r2) {
-            // Double-check both players are still available (not matched in the meantime)
-            let my_match = csci_6221_rust2::storage::check_match(id).await;
-            let opp_match = csci_6221_rust2::storage::check_match(opp).await;
-            if my_match.is_some() || opp_match.is_some() {
-                // One of them got matched elsewhere, skip
-                continue;
-            }
-            
-            // Remove both from queue (create_match will also do this, but do it here for safety)
-            csci_6221_rust2::storage::remove_from_queue(id).await;
-            csci_6221_rust2::storage::remove_from_queue(opp).await;
-            
-            let mid = rand::thread_rng().gen_range(10000..99999);
-            
-            csci_6221_rust2::storage::create_match(id, opp, mid).await;
-            
-            // Create generic game session (game-agnostic)
-            // Session ID format: game_<match_id> (games can use their own prefix)
-            let session_id = format!("game_{}", mid);
-            // Randomly assign slots (1 or 2)
-            let (p1_slot, p2_slot) = if rand::random::<bool>() {
-                (1, 2)
-            } else {
-                (2, 1)
-            };
-            // Randomly assign which player gets which slot
-            let (p1_id, p2_id) = if rand::random::<bool>() {
-                (id, opp)
-            } else {
-                (opp, id)
-            };
-            
-            csci_6221_rust2::storage::create_game_session(mid, session_id.clone(), p1_id, p2_id, p1_slot, p2_slot).await;
-            
-            response.insert("status".to_string(), "matched".to_string());
-            response.insert("opponent".to_string(), opp.to_string());
-            response.insert("session_id".to_string(), session_id.clone());
-            response.insert("game_url".to_string(), format!("/play/{}?player_id={}&player_name=Player{}", session_id, id, id));
-            return Json(response);
-        }
-    }
-    
-    // 3. No match found
-    response.insert("status".to_string(), "queued".to_string());
-    Json(response)
-}
-
-async fn play_game(Path(session_id): Path<String>, Query(params): Query<HashMap<String, String>>) -> Result<Html<String>, StatusCode> {
-    // Get player_id and player_name from query params, or try to get from game session
-    let player_id = params.get("player_id").and_then(|s| s.parse::<u64>().ok());
-    let player_name = params.get("player_name").map(|s| s.clone());
-    
-    // If not provided, try to get from game session
-    let (final_player_id, final_player_name) = if let Some((_, p1_id, p2_id, _, _)) = csci_6221_rust2::storage::get_game_session(&session_id).await {
-        // Use the first player ID if player_id not provided
-        let pid = player_id.unwrap_or(p1_id);
-        let pname = player_name.unwrap_or_else(|| format!("Player{}", pid));
-        (pid, pname)
-    } else {
-        // Fallback if session not found
-        let pid = player_id.unwrap_or(0);
-        let pname = player_name.unwrap_or_else(|| "Player".to_string());
-        (pid, pname)
-    };
-    
-    // Determine game type from session ID prefix (generic - works for any game)
-    // Games can use their own prefix (e.g., "pong_", "race_") or the generic "game_" prefix
-    let game_info = if session_id.starts_with("pong_") {
-        ("Pong", "pong_game", "pong_client", "pong_server")
-    } else if session_id.starts_with("race_") {
-        ("Race", "race_game", "race_client", "race_server")
-    } else if session_id.starts_with("game_") {
-        // Generic game session - show generic instructions
-        // Games should handle their own connection logic
-        ("Game", "game", "game_client", "game_server")
-    } else {
-        // Unknown game type - show generic instructions
-        ("Game", "game", "game_client", "game_server")
-    };
-    
-    // Create HTML page with generic game instructions
-    let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Join {} Game</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 30px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #4CAF50;
-            margin-top: 0;
-        }}
-        .command-box {{
-            background: #1a1a1a;
-            padding: 15px;
-            border-radius: 8px;
-            border: 2px solid #4CAF50;
-            font-family: 'Courier New', monospace;
-            margin: 20px 0;
-            word-break: break-all;
-        }}
-        .copy-btn {{
-            background: #4CAF50;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            margin-top: 10px;
-        }}
-        .copy-btn:hover {{
-            background: #45a049;
-        }}
-        .info {{
-            background: #333;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 15px 0;
-        }}
-        .back-link {{
-            color: #4CAF50;
-            text-decoration: none;
-            margin-top: 20px;
-            display: inline-block;
-        }}
-        .warning {{
-            background: #ff9800;
-            color: white;
-            padding: 10px;
-            border-radius: 6px;
-            margin: 15px 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎮 Join {} Game</h1>
-        <div class="info">
-            <p><strong>Session ID:</strong> {}</p>
-            <p><strong>Player ID:</strong> {}</p>
-            <p><strong>Player Name:</strong> {}</p>
-        </div>
-        
-        <h3>Run this command in your terminal:</h3>
-        <div class="command-box" id="command">
-cd {} && cargo run --bin {} -- {} {} {}
-        </div>
-        <button class="copy-btn" onclick="copyCommand()">📋 Copy Command</button>
-        
-        <div class="warning">
-            <strong>⚠️ Note:</strong> Make sure the {} game server is running:
-            <div class="command-box" style="border-color: #ff9800; margin-top: 10px;">
-cd {} && cargo run --bin {}
-            </div>
-        </div>
-        
-        <div class="info" style="margin-top: 20px;">
-            <p><strong>Session Details:</strong></p>
-            <p>Use the session ID <code>{}</code> to connect to the game.</p>
-            <p>Each game implementation may have different connection requirements.</p>
-        </div>
-        
-        <a href="/" class="back-link">← Back to Dashboard</a>
-    </div>
-    
-    <script>
-        function copyCommand() {{
-            const command = document.getElementById('command').textContent.trim();
-            navigator.clipboard.writeText(command).then(() => {{
-                alert('Command copied to clipboard!');
-            }});
-        }}
-    </script>
-</body>
-</html>
-    "#, game_info.0, game_info.0, session_id, final_player_id, final_player_name, 
-        game_info.1, game_info.2, final_player_id, final_player_name, session_id,
-        game_info.0, game_info.1, game_info.3, session_id);
-    
-    Ok(Html(html))
-}
-
-// Game configuration for local launch
-struct GameConfig {
-    name: &'static str,
-    game_dir: &'static str,
-    local_bin: &'static str,
-    controls: &'static str,
-}
-
-fn get_game_config(session_id: &str) -> Option<GameConfig> {
-    // Determine game type from session ID prefix
-    if session_id.starts_with("pong_") {
-        Some(GameConfig {
-            name: "Pong",
-            game_dir: "pong_game",
-            local_bin: "pong_local",
-            controls: "Player 1 (Left/Blue): W (up) / S (down)\nPlayer 2 (Right/Red): ↑ (up) / ↓ (down)",
-        })
-    } else if session_id.starts_with("race_") {
-        Some(GameConfig {
-            name: "Race",
-            game_dir: "race_game",
-            local_bin: "race_local",
-            controls: "Player 1: WASD\nPlayer 2: Arrow Keys",
-        })
-    } else if session_id.starts_with("game_") {
-        // Generic game session - try to detect from directory structure
-        // For now, default to pong if pong_game exists, otherwise show generic message
-        let project_dir = std::env::current_dir().unwrap_or_default();
-        if project_dir.join("pong_game").exists() {
-            Some(GameConfig {
-                name: "Game",
-                game_dir: "pong_game",
-                local_bin: "pong_local",
-                controls: "Player 1 (Left/Blue): W (up) / S (down)\nPlayer 2 (Right/Red): ↑ (up) / ↓ (down)",
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-async fn launch_local_game(Path(session_id): Path<String>) -> Result<Html<String>, StatusCode> {
-    // Verify session exists
-    if csci_6221_rust2::storage::get_game_session(&session_id).await.is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    // Get game configuration based on session ID
-    let game_config = match get_game_config(&session_id) {
-        Some(config) => config,
-        None => {
-            // Return error page for unsupported game
-            let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launch Error</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #f44336;
-            margin-top: 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Launch Error</h1>
-        <p>No local game client available for session: {}</p>
-        <p style="color: #888;">This game type may not support local multiplayer mode.</p>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-            "#, session_id);
-            return Ok(Html(html));
-        }
-    };
-
-    // Get project directory
-    let project_dir = std::env::current_dir().unwrap_or_default();
-    let game_dir = project_dir.join(game_config.game_dir);
-    
-    // Check if game directory exists
-    if !game_dir.exists() {
-        let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launch Error</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #f44336;
-            margin-top: 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Launch Error</h1>
-        <p>Game directory not found: {}</p>
-        <p style="color: #888;">Make sure the game is properly installed.</p>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-        "#, game_config.game_dir);
-        return Ok(Html(html));
-    }
-    
-    // Launch the local game client (generic - works for any game)
-    // Use platform-specific commands to launch in background
-    #[cfg(unix)]
-    let mut cmd = {
-        use std::process::{Command, Stdio};
-        let game_dir_str = game_dir.to_string_lossy().to_string();
-        let mut shell_cmd = Command::new("sh");
-        shell_cmd.arg("-c")
-                 .arg(format!(
-                     "cd '{}' && nohup cargo run --bin {} -- {} > /dev/null 2>&1 &",
-                     game_dir_str, game_config.local_bin, session_id
-                 ))
-                 .stdin(Stdio::null())
-                 .stdout(Stdio::null())
-                 .stderr(Stdio::null());
-        shell_cmd
-    };
-    
-    #[cfg(windows)]
-    let mut cmd = {
-        use std::process::Command;
-        let mut shell_cmd = Command::new("cmd");
-        shell_cmd.arg("/C")
-                 .arg(format!(
-                     "cd /d {} && start \"Local Game\" cargo run --bin {} -- {}",
-                     game_dir.display(), game_config.local_bin, session_id
-                 ));
-        shell_cmd
-    };
-    
-    // Spawn the process
-    match cmd.spawn() {
-        Ok(_) => {
-            // Return HTML that shows the game is launching
-            let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launching {} Game</title>
-    <meta charset="utf-8">
-    <meta http-equiv="refresh" content="2;url=/">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #4CAF50;
-            margin-top: 0;
-        }}
-        .spinner {{
-            border: 4px solid #333;
-            border-top: 4px solid #4CAF50;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
-        }}
-        @keyframes spin {{
-            0% {{ transform: rotate(0deg); }}
-            100% {{ transform: rotate(360deg); }}
-        }}
-        .controls {{
-            white-space: pre-line;
-            text-align: left;
-            background: #333;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 20px 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎮 Launching {} Game</h1>
-        <div class="spinner"></div>
-        <p>The game window should open shortly...</p>
-        <p style="font-size: 14px; color: #888;">Session: {}</p>
-        <div class="controls">
-            <strong>Controls:</strong><br>
-            {}
-        </div>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-            "#, game_config.name, game_config.name, session_id, game_config.controls);
-            Ok(Html(html))
-        }
-        Err(e) => {
-            // Return error page
-            let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launch Error</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #f44336;
-            margin-top: 0;
-        }}
-        .command-box {{
-            background: #1a1a1a;
-            padding: 15px;
-            border-radius: 8px;
-            border: 2px solid #f44336;
-            font-family: 'Courier New', monospace;
-            margin: 20px 0;
-            word-break: break-all;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Launch Error</h1>
-        <p>Failed to launch game automatically.</p>
-        <p style="color: #888;">Error: {}</p>
-        <p>Please run this command manually:</p>
-        <div class="command-box">
-            cd {} && cargo run --bin {} -- {}
-        </div>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-            "#, e, game_config.game_dir, game_config.local_bin, session_id);
-            Ok(Html(html))
-        }
     }
 }
 
@@ -795,346 +190,154 @@ async fn launch_viewer(Path(session_id): Path<String>) -> Result<Html<String>, S
         }
     };
 
-    // Get project directory
-    let project_dir = std::env::current_dir().unwrap_or_default();
-    let game_dir = project_dir.join(game_config.game_dir);
+    // Register player if not already registered (with random rating)
+    if status == "unknown" || !csci_6221_rust2::storage::get_rating(payload.player_id).await > 0 {
+        let rating = rand::thread_rng().gen_range(1100..1900);
+        csci_6221_rust2::storage::register_player(payload.player_id, rating).await;
+    }
+
+    // Add player to queue directly (no TCP connection needed)
+    csci_6221_rust2::storage::push_to_queue(payload.player_id).await;
     
-    // Check if game directory exists
-    if !game_dir.exists() {
-        let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launch Error</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #f44336;
-            margin-top: 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Launch Error</h1>
-        <p>Game directory not found: {}</p>
-        <p style="color: #888;">Make sure the game is properly installed.</p>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-        "#, game_config.game_dir);
-        return Ok(Html(html));
+    // Verify player is actually in the queue
+    let queue = csci_6221_rust2::storage::get_full_queue().await;
+    if !queue.contains(&payload.player_id) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     
-    // Determine viewer binary name (generic - works for any game)
-    let viewer_bin = if session_id.starts_with("pong_") || session_id.starts_with("game_") {
-        "pong_viewer"
-    } else if session_id.starts_with("race_") {
-        "race_viewer"
-    } else {
-        "game_viewer"
-    };
+    let mut response = HashMap::new();
+    response.insert("status".to_string(), "queued".to_string());
+    response.insert("player_id".to_string(), payload.player_id.to_string());
+    response.insert("message".to_string(), "Successfully added to queue".to_string());
     
-    // Launch the viewer client (generic - works for any game)
-    // Use proper process detachment for GUI applications
-    #[cfg(unix)]
-    let mut cmd = {
-        use std::process::{Command, Stdio};
-        let game_dir_str = game_dir.to_string_lossy().to_string();
-        let mut shell_cmd = Command::new("sh");
-        shell_cmd.arg("-c")
-                 .arg(format!(
-                     "cd '{}' && nohup cargo run --bin {} -- {} > /dev/null 2>&1 &",
-                     game_dir_str, viewer_bin, session_id
-                 ))
-                 .stdin(Stdio::null())
-                 .stdout(Stdio::null())
-                 .stderr(Stdio::null());
-        shell_cmd
-    };
-    
-    #[cfg(windows)]
-    let mut cmd = {
-        use std::process::Command;
-        let mut shell_cmd = Command::new("cmd");
-        shell_cmd.arg("/C")
-                 .arg(format!(
-                     "cd /d {} && start \"Viewer\" cargo run --bin {} -- {}",
-                     game_dir.display(), viewer_bin, session_id
-                 ));
-        shell_cmd
-    };
-    
-    // Spawn the process
-    match cmd.spawn() {
-        Ok(_) => {
-            // Return HTML that shows the viewer is launching
-            let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launching {} Viewer</title>
-    <meta charset="utf-8">
-    <meta http-equiv="refresh" content="2;url=/">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #9C27B0;
-            margin-top: 0;
-        }}
-        .spinner {{
-            border: 4px solid #333;
-            border-top: 4px solid #9C27B0;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
-        }}
-        @keyframes spin {{
-            0% {{ transform: rotate(0deg); }}
-            100% {{ transform: rotate(360deg); }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>👁️ Launching {} Viewer</h1>
-        <div class="spinner"></div>
-        <p>The viewer window should open shortly...</p>
-        <p style="font-size: 14px; color: #888;">Session: {}</p>
-        <p style="margin-top: 30px;">
-            <strong>Watching:</strong> Bot Game
-        </p>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #9C27B0;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-            "#, game_config.name, game_config.name, session_id);
-            Ok(Html(html))
-        }
-        Err(e) => {
-            // Return error page
-            let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Launch Error</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 600px;
-            margin: 100px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-            text-align: center;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #f44336;
-            margin-top: 0;
-        }}
-        .command-box {{
-            background: #1a1a1a;
-            padding: 15px;
-            border-radius: 8px;
-            border: 2px solid #f44336;
-            font-family: 'Courier New', monospace;
-            margin: 20px 0;
-            word-break: break-all;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>❌ Launch Error</h1>
-        <p>Failed to launch viewer automatically.</p>
-        <p style="color: #888;">Error: {}</p>
-        <p>Please run this command manually:</p>
-        <div class="command-box">
-            cd {} && cargo run --bin {} -- {}
-        </div>
-        <p style="margin-top: 20px;">
-            <a href="/" style="color: #4CAF50;">← Back to Dashboard</a>
-        </p>
-    </div>
-</body>
-</html>
-            "#, e, game_config.game_dir, viewer_bin, session_id);
-            Ok(Html(html))
-        }
-    }
+    Ok(Json(response))
 }
 
-async fn view_game(Path(session_id): Path<String>) -> Result<Html<String>, StatusCode> {
-    // Verify session exists
-    if csci_6221_rust2::storage::get_game_session(&session_id).await.is_none() {
-        return Err(StatusCode::NOT_FOUND);
+async fn player_status(Path(id): Path<u64>) -> Json<HashMap<String, String>> {
+    let mut response = HashMap::new();
+    
+    // 1. Check if player is already matched
+    if let Some((opp, _)) = csci_6221_rust2::storage::check_match(id).await {
+        if let Some(match_id) = csci_6221_rust2::storage::get_match_id_by_players(id, opp).await {
+            if let Some(session_id) = csci_6221_rust2::storage::get_game_session_by_match(match_id).await {
+                let server_ip = get_local_ip().unwrap_or_else(|| "localhost".to_string());
+                response.insert("status".to_string(), "matched".to_string());
+                response.insert("opponent".to_string(), opp.to_string());
+                response.insert("session_id".to_string(), session_id.clone());
+                response.insert("game_url".to_string(), format!("http://{}:8889/play/{}?player_id={}&player_name=Player{}", server_ip, session_id, id, id));
+                return Json(response);
+            } else {
+                response.insert("status".to_string(), "matched".to_string());
+                response.insert("opponent".to_string(), opp.to_string());
+                return Json(response);
+            }
+        }
     }
     
-    // Determine game type from session ID prefix (generic - works for any game)
-    // Games can use their own prefix (e.g., "pong_", "race_") or the generic "game_" prefix
-    let game_info = if session_id.starts_with("pong_") {
-        ("Pong", "pong_game", "pong_client", "pong_server")
-    } else if session_id.starts_with("race_") {
-        ("Race", "race_game", "race_client", "race_server")
-    } else if session_id.starts_with("game_") {
-        // Generic game session - show generic instructions
-        // Games should handle their own connection logic
-        ("Game", "game", "game_client", "game_server")
+    // 2. Try to match this player (active matchmaking)
+    // Bots can only match with bots, real players only with real players
+    let is_me_bot = csci_6221_rust2::storage::is_bot(id).await;
+    let my_rating = csci_6221_rust2::storage::get_rating(id).await;
+    let mut q = csci_6221_rust2::storage::get_full_queue().await;
+    
+    // Remove myself from local view
+    q.retain(|&x| x != id);
+    
+    // Filter queue: bots match with bots, real players match with real players
+    // Also exclude players already in a match
+    let mut candidates = Vec::new();
+    for player_id in q {
+        let is_opp_bot = csci_6221_rust2::storage::is_bot(player_id).await;
+        // Only match if both are bots OR both are real players
+        if is_me_bot == is_opp_bot {
+            // Check if opponent is already in a match
+            let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+            let mut con = client.get_multiplexed_async_connection().await.unwrap();
+            let key = format!("player:{}", player_id);
+            let opp_status: String = con.hget(&key, "status").await.unwrap_or("idle".into());
+            // Only include if not already in a match
+            if opp_status != "inmatch" {
+                candidates.push(player_id);
+            }
+        }
+    }
+    
+    // Try to match with candidates
+    for opp in candidates {
+        let r2 = csci_6221_rust2::storage::get_rating(opp).await;
+        
+        if csci_6221_rust2::matchmaking::hybrid_c_decision(my_rating, r2) {
+            // Remove both from queue
+            csci_6221_rust2::storage::remove_from_queue(id).await;
+            csci_6221_rust2::storage::remove_from_queue(opp).await;
+            
+            let mid = rand::thread_rng().gen_range(10000..99999);
+            
+            csci_6221_rust2::storage::create_match(id, opp, mid).await;
+            
+            // Create game session for race game
+            let session_id = format!("race_{}", mid);
+            // Randomly assign slots (1 or 2)
+            let (p1_slot, p2_slot) = if rand::random::<bool>() {
+                (1, 2)
+            } else {
+                (2, 1)
+            };
+            // Randomly assign which player gets which slot
+            let (p1_id, p2_id) = if rand::random::<bool>() {
+                (id, opp)
+            } else {
+                (opp, id)
+            };
+            
+            csci_6221_rust2::storage::create_game_session(mid, session_id.clone(), p1_id, p2_id, p1_slot, p2_slot).await;
+            
+            let server_ip = get_local_ip().unwrap_or_else(|| "localhost".to_string());
+            response.insert("status".to_string(), "matched".to_string());
+            response.insert("opponent".to_string(), opp.to_string());
+            response.insert("session_id".to_string(), session_id.clone());
+            response.insert("game_url".to_string(), format!("http://{}:8889/play/{}?player_id={}&player_name=Player{}", server_ip, session_id, id, id));
+            return Json(response);
+        }
+    }
+    
+    // 3. No match found
+    response.insert("status".to_string(), "queued".to_string());
+    Json(response)
+}
+
+async fn play_game(Path(session_id): Path<String>, Query(params): Query<HashMap<String, String>>) -> Result<Redirect, StatusCode> {
+    // Get player_id and player_name from query params, or try to get from game session
+    let player_id = params.get("player_id").and_then(|s| s.parse::<u64>().ok());
+    let player_name = params.get("player_name").map(|s| s.clone());
+    
+    // If not provided, try to get from game session
+    let (final_player_id, final_player_name) = if let Some((_, p1_id, p2_id, _, _)) = csci_6221_rust2::storage::get_game_session(&session_id).await {
+        // Use the first player ID if player_id not provided
+        let pid = player_id.unwrap_or(p1_id);
+        let pname = player_name.unwrap_or_else(|| format!("Player{}", pid));
+        (pid, pname)
     } else {
-        // Unknown game type - show generic instructions
-        ("Game", "game", "game_client", "game_server")
+        // Fallback if session not found
+        let pid = player_id.unwrap_or(0);
+        let pname = player_name.unwrap_or_else(|| "Player".to_string());
+        (pid, pname)
     };
     
-    // Create HTML page with generic viewer instructions
-    let html = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watch {} Game</title>
-    <meta charset="utf-8">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #e0e0e0;
-        }}
-        .container {{
-            background: #2a2a2a;
-            padding: 30px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{
-            color: #2196F3;
-            margin-top: 0;
-        }}
-        .command-box {{
-            background: #1a1a1a;
-            padding: 15px;
-            border-radius: 8px;
-            border: 2px solid #2196F3;
-            font-family: 'Courier New', monospace;
-            margin: 20px 0;
-            word-break: break-all;
-        }}
-        .copy-btn {{
-            background: #2196F3;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            margin-top: 10px;
-        }}
-        .copy-btn:hover {{
-            background: #1976D2;
-        }}
-        .info {{
-            background: #333;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 15px 0;
-        }}
-        .back-link {{
-            color: #2196F3;
-            text-decoration: none;
-            margin-top: 20px;
-            display: inline-block;
-        }}
-        .warning {{
-            background: #ff9800;
-            color: white;
-            padding: 10px;
-            border-radius: 6px;
-            margin: 15px 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>👁️ Watch {} Game</h1>
-        <div class="info">
-            <p><strong>Session ID:</strong> {}</p>
-            <p>You can watch this game as a spectator.</p>
-        </div>
-        
-        <h3>Run this command in your terminal:</h3>
-        <div class="command-box" id="command">
-cd {} && cargo run --bin {} -- {}
-        </div>
-        <button class="copy-btn" onclick="copyCommand()">📋 Copy Command</button>
-        
-        <div class="warning">
-            <strong>⚠️ Note:</strong> Make sure the {} game server is running:
-            <div class="command-box" style="border-color: #ff9800; margin-top: 10px;">
-cd {} && cargo run --bin {}
-            </div>
-        </div>
-        
-        <a href="/" class="back-link">← Back to Dashboard</a>
-    </div>
+    // Get server IP for redirect
+    let server_ip = get_local_ip().unwrap_or_else(|| "localhost".to_string());
+    let redirect_url = format!("http://{}:8889/play/{}?player_id={}&player_name={}", 
+                              server_ip, session_id, final_player_id, urlencoding::encode(&final_player_name));
     
-    <script>
-        function copyCommand() {{
-            const command = document.getElementById('command').textContent.trim();
-            navigator.clipboard.writeText(command).then(() => {{
-                alert('Command copied to clipboard!');
-            }});
-        }}
-    </script>
-</body>
-</html>
-    "#, game_info.0, game_info.0, session_id, game_info.1, game_info.2, session_id,
-        game_info.0, game_info.1, game_info.3);
+    Ok(Redirect::temporary(&redirect_url))
+}
+
+async fn view_game(Path(session_id): Path<String>) -> Result<Redirect, StatusCode> {
+    // Get server IP for redirect
+    let server_ip = get_local_ip().unwrap_or_else(|| "localhost".to_string());
+    let redirect_url = format!("http://{}:8889/view/{}", server_ip, session_id);
     
-    Ok(Html(html))
+    Ok(Redirect::temporary(&redirect_url))
 }
 
 async fn dashboard() -> Html<String> {
@@ -1185,45 +388,11 @@ async fn dashboard() -> Html<String> {
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
         </head>
         <body>
-            <div id="player_header" style="background:var(--panel); padding:16px 20px; border-radius:14px; margin-bottom:24px; border:1px solid var(--panel-border); display:none;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
-                    <div>
-                        <h2 style="margin:0; font-size:20px; color:var(--accent);">Player ID: <span id="display_player_id" style="color:var(--text);">-</span></h2>
-                        <p style="margin:4px 0 0; font-size:12px; color:var(--muted);">Your official ID for this session</p>
-                    </div>
-                    <button onclick="leaveGame()" 
-                            style="background:var(--accent); border:none; color:white; padding:8px 16px; 
-                                   border-radius:6px; cursor:pointer; font-size:12px; font-weight:600;">
-                        Leave Game
-                    </button>
-                </div>
-            </div>
-            <h1>Matchmaking Dashboard</h1>
-            <div id="player_setup" style="background:var(--panel); padding:20px; border-radius:14px; margin-bottom:24px; border:1px solid var(--panel-border);">
-                <h2 style="margin:0 0 12px; font-size:18px;">🎮 Enter Your Player ID</h2>
-                <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-                    <input type="text" id="player_id_input" placeholder="Enter your unique Player ID" 
-                           style="padding:10px; border-radius:8px; border:1px solid var(--panel-border); 
-                                  background:#20262d; color:var(--text); font-size:14px; flex:1; min-width:200px;" />
-                    <button onclick="setPlayerId()" 
-                            style="background:var(--accent); border:none; color:white; padding:10px 24px; 
-                                   border-radius:8px; cursor:pointer; font-size:14px; font-weight:600;">
-                        Set Player ID
-                    </button>
-                </div>
-                <div id="player_id_status" style="margin-top:12px; font-size:14px;"></div>
-            </div>
-            <div id="queue_section" style="background:var(--panel); padding:20px; border-radius:14px; margin-bottom:24px; border:1px solid var(--panel-border); display:none;">
-                <h2 style="margin:0 0 12px; font-size:18px;">📥 Join Matchmaking Queue</h2>
-                <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-                    <button onclick="joinQueue()" 
-                            style="background:var(--inmatch); border:none; color:white; padding:12px 32px; 
-                                   border-radius:8px; cursor:pointer; font-size:16px; font-weight:600;">
-                        Join Queue
-                    </button>
-                </div>
-                <div id="queue_status" style="margin-top:12px; font-size:14px;"></div>
-            </div>
+            <!-- Player header removed (dashboard is read-only lobby) -->
+            <h1>Game Lobby</h1>
+          <!-- Player ID input removed: dashboard now allows joining the queue without pre-setting an ID.
+              The queue button will prompt for an ID if one isn't stored in sessionStorage. -->
+                <!-- Queue section removed — this page is now a read-only lobby overview. -->
             <div class="grid">
                 <div id="queued" class="panel">
                     <h2><span>Queued Players</span><span class="count" id="queued_count">0</span></h2>
@@ -1407,56 +576,28 @@ async fn dashboard() -> Html<String> {
                             const matchId = m.id.replace('match:', '');
                             let buttons = '';
                             if (m.session_id) {
-                                // Check if this is a bot match
-                                if (m.is_bot_match) {
-                                    // Bot match: show viewer option instead of play options
-                                    const viewUrl = `/view/${m.session_id}`;
-                                    const launchViewerUrl = `/launch_viewer/${m.session_id}`;
+                                // Get server hostname (same host as dashboard, different port)
+                                const serverHost = window.location.hostname;
+                                const raceWebPort = 8889;
+                                const p1Url = `http://${serverHost}:${raceWebPort}/play/${m.session_id}?player_id=${m.a}&player_name=Player${m.a}`;
+                                const p2Url = `http://${serverHost}:${raceWebPort}/play/${m.session_id}?player_id=${m.b}&player_name=Player${m.b}`;
+                                const viewUrl = `http://${serverHost}:${raceWebPort}/view/${m.session_id}`;
                                 buttons = `
                                     <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
-                                            <a href="${launchViewerUrl}" 
-                                               style="background:#9C27B0; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                👁️ Watch Bot Game
-                                            </a>
-                                            <a href="${viewUrl}" 
-                                               style="background:#7a8694; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                📋 Manual Watch
-                                            </a>
-                                        </div>
-                                        <div style="margin-top:4px; font-size:11px; color:var(--muted);">
-                                            Session: ${m.session_id} | Bot Match (P${m.a} vs P${m.b})
-                                        </div>
-                                    `;
-                                } else {
-                                    // Player match: show play options
-                                    const launchUrl = `/launch/${m.session_id}`;
-                                    const p1Url = `/play/${m.session_id}?player_id=${m.a}&player_name=Player${m.a}`;
-                                    const p2Url = `/play/${m.session_id}?player_id=${m.b}&player_name=Player${m.b}`;
-                                    const viewUrl = `/view/${m.session_id}`;
-                                    buttons = `
-                                        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
-                                            <a href="${launchUrl}" 
-                                               style="background:#4CAF50; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                🎮 Launch Local (Both Players)
-                                            </a>
                                         <a href="${p1Url}" 
-                                               style="background:#2196F3; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                P${m.a} Play
+                                           style="background:#3a7bd5; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
+                                            P${m.a} Enter Game
                                         </a>
                                         <a href="${p2Url}" 
-                                               style="background:#2196F3; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                P${m.b} Play
+                                           style="background:#3a7bd5; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
+                                            P${m.b} Enter Game
                                         </a>
                                         <a href="${viewUrl}" 
                                            style="background:#7a8694; border:none; color:white; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                👁️ Watch
+                                            👁️ View
                                         </a>
                                     </div>
-                                        <div style="margin-top:4px; font-size:11px; color:var(--muted);">
-                                            Session: ${m.session_id} | Local: Both players on same screen
-                                    </div>
                                 `;
-                                }
                             }
                             const content = `
                                 <div>
@@ -1488,169 +629,9 @@ async fn dashboard() -> Html<String> {
                 window.location.href = `/view/${sessionId}`;
             }
             
-            // Check for existing player ID on page load
+            // Dashboard is read-only; no player header or leave action.
             let currentPlayerId = null;
-            
-            window.addEventListener('DOMContentLoaded', () => {
-                const savedId = sessionStorage.getItem('player_id');
-                if (savedId) {
-                    currentPlayerId = savedId;
-                    showPlayerInterface(savedId);
-                }
-            });
-            
-            function setPlayerId() {
-                const playerIdInput = document.getElementById('player_id_input');
-                const statusDiv = document.getElementById('player_id_status');
-                const playerId = playerIdInput.value.trim();
-                
-                if (!playerId) {
-                    statusDiv.innerHTML = '<span style="color:var(--accent);">Please enter a Player ID</span>';
-                    return;
-                }
-                
-                // Check if player ID is already set
-                if (currentPlayerId) {
-                    statusDiv.innerHTML = '<span style="color:var(--accent);">Player ID already set. Leave the game to set a new ID.</span>';
-                    return;
-                }
-                
-                // Store in session storage
-                sessionStorage.setItem('player_id', playerId);
-                currentPlayerId = playerId;
-                
-                // Show player interface
-                showPlayerInterface(playerId);
-                
-                statusDiv.innerHTML = `<span style="color:var(--inmatch);">✅ Player ID set: ${playerId}</span>`;
-            }
-            
-            function showPlayerInterface(playerId) {
-                // Hide setup section
-                document.getElementById('player_setup').style.display = 'none';
-                
-                // Show player header
-                document.getElementById('player_header').style.display = 'block';
-                document.getElementById('display_player_id').textContent = playerId;
-                
-                // Show queue section
-                document.getElementById('queue_section').style.display = 'block';
-            }
-            
-            function leaveGame() {
-                if (confirm('Are you sure you want to leave? This will remove you from the queue and clear your session.')) {
-                    sessionStorage.removeItem('player_id');
-                    currentPlayerId = null;
-                    
-                    // Hide player interface
-                    document.getElementById('player_header').style.display = 'none';
-                    document.getElementById('queue_section').style.display = 'none';
-                    document.getElementById('queue_status').innerHTML = '';
-                    
-                    // Show setup section
-                    document.getElementById('player_setup').style.display = 'block';
-                    document.getElementById('player_id_input').value = '';
-                    document.getElementById('player_id_status').innerHTML = '';
-                }
-            }
-            
-            async function joinQueue() {
-                if (!currentPlayerId) {
-                    document.getElementById('queue_status').innerHTML = '<span style="color:var(--accent);">Please set your Player ID first</span>';
-                    return;
-                }
-                
-                const statusDiv = document.getElementById('queue_status');
-                const playerId = currentPlayerId;
-                
-                // Try to parse as number, if it fails, use hash of string
-                let playerIdNum;
-                if (!isNaN(playerId) && playerId !== '') {
-                    playerIdNum = parseInt(playerId);
-                } else {
-                    // Convert string to number using hash
-                    let hash = 0;
-                    for (let i = 0; i < playerId.length; i++) {
-                        const char = playerId.charCodeAt(i);
-                        hash = ((hash << 5) - hash) + char;
-                        hash = hash & hash; // Convert to 32bit integer
-                    }
-                    playerIdNum = Math.abs(hash) % 1000000; // Keep it reasonable
-                }
-                
-                statusDiv.innerHTML = '<span style="color:var(--queued);">Joining queue...</span>';
-                
-                try {
-                    const response = await fetch('/queue', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ player_id: playerIdNum })
-                    });
-                    
-                    if (response.ok) {
-                        const data = await response.json();
-                        statusDiv.innerHTML = `<span style="color:var(--inmatch);">✅ Successfully queued as Player ${data.player_id}! Waiting to be matched with a real player...</span>`;
-                        // Start polling for match status
-                        pollPlayerStatus(playerIdNum);
-                    } else {
-                        statusDiv.innerHTML = '<span style="color:var(--accent);">❌ Failed to join queue. Please try again.</span>';
-                    }
-                } catch (error) {
-                    statusDiv.innerHTML = '<span style="color:var(--accent);">❌ Error connecting to server. Make sure the server is running.</span>';
-                    console.error('Queue error:', error);
-                }
-            }
-            
-            async function pollPlayerStatus(playerId) {
-                const statusDiv = document.getElementById('queue_status');
-                const interval = setInterval(async () => {
-                    try {
-                        const response = await fetch(`/player/${playerId}/status`);
-                        if (response.ok) {
-                            const data = await response.json();
-                            if (data.status === 'matched' && data.game_url) {
-                                clearInterval(interval);
-                                statusDiv.innerHTML = `<span style="color:var(--inmatch);">🎯 Match found! <a href="${data.game_url}" style="color:var(--inmatch); text-decoration:underline;">Click here to join the game</a></span>`;
-                            } else if (data.status === 'matched') {
-                                if (data.session_id) {
-                                    const playUrl = `/play/${data.session_id}?player_id=${data.player_id}&player_name=Player${data.player_id}`;
-                                    const launchUrl = `/launch/${data.session_id}`;
-                                    statusDiv.innerHTML = `
-                                        <span style="color:var(--inmatch);">🎯 Matched with Player ${data.opponent}!</span><br>
-                                        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
-                                            <a href="${launchUrl}" 
-                                               style="background:#4CAF50; border:none; color:white; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:14px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                🎮 Launch Local Game (Both Players)
-                                            </a>
-                                            <a href="${playUrl}" 
-                                               style="background:#2196F3; border:none; color:white; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:14px; font-weight:500; text-decoration:none; display:inline-block;">
-                                                📋 Manual Join
-                                            </a>
-                                        </div>
-                                        <p style="margin-top:8px; font-size:12px; color:var(--muted);">
-                                            Local Game: Both players on same screen<br>
-                                            Player 1: W/S | Player 2: ↑/↓
-                                        </p>
-                                    `;
-                                    // Auto-launch the game after 1 second
-                                    setTimeout(() => {
-                                        window.location.href = launchUrl;
-                                    }, 1000);
-                                } else {
-                                statusDiv.innerHTML = `<span style="color:var(--inmatch);">🎯 Matched with Player ${data.opponent}! Waiting for game session...</span>`;
-                                }
-                            } else {
-                                statusDiv.innerHTML = `<span style="color:var(--queued);">⏳ Still in queue... (refreshing every 2s)</span>`;
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Status poll error:', error);
-                    }
-                }, 2000);
-                
-                // Stop polling after 5 minutes
-                setTimeout(() => clearInterval(interval), 300000);
-            }
+            try { const savedId = sessionStorage.getItem('player_id'); if (savedId) currentPlayerId = savedId; } catch(e) { /* ignore */ }
             
             refresh();
             setInterval(refresh, 2000);

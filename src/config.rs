@@ -6,7 +6,6 @@ pub struct AppCfg {
 impl Default for AppCfg {
     fn default() -> Self {
         Self {
-            // use 7500 to avoid your “address already in use” on 7000
             tcp_addr: "0.0.0.0:7500".into(),
         }
     }

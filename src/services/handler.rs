@@ -1,4 +1,4 @@
-use crate::models::{PlayerId, Player};
+use crate::{models::{Player, PlayerId, Mmr}};
 use redis::{AsyncCommands, aio::MultiplexedConnection, io::tcp::socket2::Protocol};
 use tokio::{io::AsyncReadExt, net::{TcpStream}, sync::mpsc::Sender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -25,24 +25,27 @@ pub enum ProtocolError {
 struct PlayerHandler {
     framed: Framed<TcpStream, LengthDelimitedCodec>,
     redis_con: MultiplexedConnection,
-    player: Option<Player>,
+    pid: Option<PlayerId>,
     send_to_matchmaker: Sender<Command>,
 }
 
 impl PlayerHandler {
     pub fn new(socket: TcpStream, send_to_matchmaker: Sender<Command>, redis_con: MultiplexedConnection) -> PlayerHandler{
         let framed = Framed::new(socket, LengthDelimitedCodec::new());
-        let player: Option<Player> = None;
+        let pid: Option<PlayerId> = None;
         PlayerHandler {
             framed,
             redis_con,
-            player,
+            pid,
             send_to_matchmaker
         }
     }
 
-    fn get_pid(&self) -> PlayerId {
-        self.player.pid()
+    fn get_pid(&self) -> Option<PlayerId> {
+        match &self.pid {
+            Some(pid) => Some(*pid),
+            None => None
+        }
     }
 
     async fn get_player_message(&mut self) -> Result<ProtocolMessage, ProtocolError> {
@@ -52,10 +55,10 @@ impl PlayerHandler {
     }
 
     async fn add_player(&mut self) -> Result<PlayerId, ProtocolError>{
-        self.player = Player::new();
-        let pid = player.pid();
-        let _: () = self.redis_con.zadd(pid, &player, player.mmr()).await?;
-        Ok(*pid)
+        let player= Player::new();
+        self.pid = Some(*player.pid());
+        let _: () = self.redis_con.zadd(self.pid, player, Mmr::new()).await?;
+        Ok(self.pid.unwrap())
     }
 }
 

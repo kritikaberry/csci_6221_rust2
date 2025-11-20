@@ -36,7 +36,6 @@ impl TryFrom<String> for PlayerUsername {
 #[derive(Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
 pub struct Player {
     pid: PlayerId,
-    mmr: Mmr,
 }
 
 impl Player {
@@ -46,15 +45,10 @@ impl Player {
 
         Player {
             pid,
-            mmr
         }
     }
 
     pub fn pid(&self) -> &PlayerId {
         &self.pid
-    }
-
-    pub fn mmr(&self) -> &Mmr {
-        &self.mmr
     }
 }

@@ -15,6 +15,6 @@ async fn main() {
         .try_init();
 
     let cfg = config::AppCfg::default();
-    tracing::info!("🚀 CSCI 6221 – Hybrid-C Matchmaking Server Running…");
+    tracing::info!("🚀 CSCI 6221 – Matchmaking Server Running…");
     tcp_server::start_tcp_server(&cfg.tcp_addr).await;
 }

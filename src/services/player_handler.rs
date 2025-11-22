@@ -1,4 +1,4 @@
-use crate::models::{Duel, Mmr, Player, PlayerId, duel::DuelPacket, player};
+use crate::{DatabaseHandler, models::{Duel, Mmr, Player, PlayerId, duel::DuelPacket, player}};
 use redis::{AsyncCommands, aio::MultiplexedConnection, io::tcp::socket2::Protocol};
 use tokio::{io::AsyncReadExt, net::TcpStream, sync::mpsc::{self, Sender, Receiver, error::SendError}};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -25,7 +25,7 @@ pub enum ProtocolError<T> {
     #[error("serde error: {0}")]
     ParseError(#[from] serde_json::Error),
     #[error("send to matchmaker error: {0}")]
-    SendToMatchMakerErrror(#[from] SendError<Command<T>>),
+    SendToMatchMakerError(#[from] SendError<Command<T>>),
     #[error("player shouldn't be null")]
     NullPlayer,
     #[error("did not receive sender back from matchmaker")]
@@ -34,18 +34,18 @@ pub enum ProtocolError<T> {
 
 struct PlayerHandler<T> {
     framed: Framed<TcpStream, LengthDelimitedCodec>,
-    redis_con: MultiplexedConnection,
+    db: DatabaseHandler,
     pid: Option<PlayerId>,
     send_to_matchmaker: Sender<Command<T>>,
 }
 
 impl<T> PlayerHandler<T> {
-    pub fn new(socket: TcpStream, send_to_matchmaker: Sender<Command<T>>, redis_con: MultiplexedConnection) -> PlayerHandler<T>{
+    pub fn new(socket: TcpStream, send_to_matchmaker: Sender<Command<T>>, db: DatabaseHandler) -> PlayerHandler<T>{
         let framed = Framed::new(socket, LengthDelimitedCodec::new());
         let pid: Option<PlayerId> = None;
         PlayerHandler {
             framed,
-            redis_con,
+            db,
             pid,
             send_to_matchmaker
         }
@@ -70,7 +70,7 @@ impl<T> PlayerHandler<T> {
         Ok(())
     }
 
-    async fn send_matchmaker_command(&mut self, command: Command<T>) -> Result<(), ProtocolError<T>> {
+    async fn send_matchmaker_command(&mut self, command: Command<T>) -> Result<(), SendError> {
         self.send_to_matchmaker.send(command).await?;
         Ok(())
     }
@@ -78,7 +78,7 @@ impl<T> PlayerHandler<T> {
     async fn add_player(&mut self) -> Result<PlayerId, ProtocolError<T>>{
         let player= Player::new();
         self.pid = Some(*player.pid());
-        let _: () = self.redis_con.zadd("sorted_players", self.pid, Mmr::new()).await?;
+        self.db.add_player(self.pid.unwrap());
         Ok(self.pid.unwrap())
     }
 

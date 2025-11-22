@@ -1,3 +1,4 @@
+use csci_6221_rust2::DatabaseHandler;
 use tokio::net::TcpListener;
 use std::io;
 use tokio::sync::mpsc;
@@ -9,16 +10,15 @@ mod error;
 use services::{handler::handle_client, matchmaker::{matchmaker, Command}};
 
 #[tokio::main]
-async fn main() -> redis::RedisResult<()> {
+async fn main() {
     // Open connection to redis database of players
-    let client = redis::Client::open("redis://127.0.0.1:6379").unwrap(); // ERROR HANDLE HERE
-    let mut redis_con = client.get_multiplexed_async_connection().await?;
+    let db =DatabaseHandler::new("127.0.0.1:6379").await.unwrap();
     // Create matchmaker service will use to communicate with client handlers
     let (sender, receiver) = mpsc::channel(100);
     // Start matchmaker service 
-    let mut redis_con_clone = redis_con.clone();
+    let mut db_clone = db.clone();
     tokio::spawn(async move {
-        matchmaker(receiver, redis_con_clone)
+        matchmaker(receiver, db_clone)
     });
     // Start listening for incoming player connections
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
@@ -26,9 +26,9 @@ async fn main() -> redis::RedisResult<()> {
         let (socket, _) = listener.accept().await?;
         let sender_clone = sender.clone();
         // Spawn client handler for every new player connection
-        let mut redis_con_clone = redis_con.clone();
+        let mut db_clone = db.clone();
         tokio::spawn(async move {
-            handle_client(socket, sender_clone, redis_con_clone).await
+            handle_client(socket, sender_clone, db_clone)
         });
     }
 }
